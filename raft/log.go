@@ -14,13 +14,17 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"errors"
+
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
-//  snapshot/first.....applied....committed....stabled.....last
-//  --------|------------------------------------------------|
-//                            log entries
+//	snapshot/first.....applied....committed....stabled.....last
+//	--------|------------------------------------------------|
+//	                          log entries
 //
 // for simplify the RaftLog implement should manage all log entries
 // that not truncated
@@ -50,6 +54,9 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	logger Logger
+
+	offset uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -86,14 +93,99 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	return nil
 }
 
+func (l *RaftLog) FirstIndex() uint64 {
+	return 0
+}
+
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
+	if ll := len(l.entries); ll > 0 {
+		return l.entries[ll-1].Index
+	}
 	return 0
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+	if i > l.LastIndex() {
+		return 0, errors.New("invalid index")
+	}
+	return l.entries[i].Term, nil
+}
+
+// slice returns a slice of log entries from lo through hi-1, inclusive.
+func (l *RaftLog) slice(lo, hi, maxSize uint64) ([]pb.Entry, error) {
+	err := l.mustCheckOutOfBounds(lo, hi)
+	if err != nil {
+		return nil, err
+	}
+	if lo == hi {
+		return nil, nil
+	}
+	var ents []pb.Entry
+	if lo < l.offset {
+		storedEnts, err := l.storage.Entries(lo, min(hi, l.offset))
+		if err == ErrCompacted {
+			return nil, err
+		} else if err == ErrUnavailable {
+			l.logger.Panicf("entries[%d:%d) is unavailable from storage", lo, min(hi, l.offset))
+		} else if err != nil {
+			panic(err) // TODO(bdarnell)
+		}
+
+		// check if ents has reached the size limitation
+		if uint64(len(storedEnts)) < min(hi, l.offset)-lo {
+			return storedEnts, nil
+		}
+
+		ents = storedEnts
+	}
+	if hi > l.offset {
+		//	unstable := l.unstable.slice(max(lo, l.unstable.offset), hi)
+		unstable := l.entriesSlice(max(lo, l.offset), hi)
+		if len(ents) > 0 {
+			combined := make([]pb.Entry, len(ents)+len(unstable))
+			n := copy(combined, ents)
+			copy(combined[n:], unstable)
+			ents = combined
+		} else {
+			ents = unstable
+		}
+	}
+	return limitSize(ents, maxSize), nil
+}
+
+// l.firstIndex <= lo <= hi <= l.firstIndex + len(l.entries)
+func (l *RaftLog) mustCheckOutOfBounds(lo, hi uint64) error {
+	if lo > hi {
+		l.logger.Panicf("invalid slice %d > %d", lo, hi)
+	}
+	fi := l.FirstIndex()
+	if lo < fi {
+		return ErrCompacted
+	}
+
+	length := l.LastIndex() + 1 - fi
+	if hi > fi+length {
+		l.logger.Panicf("slice[%d,%d) out of bound [%d,%d]", lo, hi, fi, l.LastIndex())
+	}
+	return nil
+}
+
+func (l *RaftLog) entriesSlice(lo, hi uint64) []pb.Entry {
+	l.entriesMustCheckOutOfBounds(lo, hi)
+	return l.entries[lo-l.offset : hi-l.offset]
+}
+
+// u.offset <= lo <= hi <= u.offset+len(u.entries)
+func (l *RaftLog) entriesMustCheckOutOfBounds(lo, hi uint64) {
+	if lo > hi {
+		l.logger.Panicf("invalid unstable.slice %d > %d", lo, hi)
+	}
+	upper := l.offset + uint64(len(l.entries))
+	if lo < l.offset || hi > upper {
+		l.logger.Panicf("unstable.slice[%d,%d) out of bound [%d,%d]", lo, hi, l.offset, upper)
+	}
 }

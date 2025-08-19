@@ -16,12 +16,19 @@ package raft
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
 // None is a placeholder node ID used when there is no leader.
 const None uint64 = 0
+
+// CampaignType represents the type of campaigning
+// the reason we use the type of string instead of uint64
+// is because it's simpler to compare and fill in raft entries
+type CampaignType string
 
 // StateType represents the role of a node in a cluster.
 type StateType uint64
@@ -30,6 +37,18 @@ const (
 	StateFollower StateType = iota
 	StateCandidate
 	StateLeader
+)
+
+// Possible values for CampaignType
+const (
+	// campaignPreElection represents the first phase of a normal election when
+	// Config.PreVote is true.
+	campaignPreElection CampaignType = "CampaignPreElection"
+	// campaignElection represents a normal (time-based) election (the second phase
+	// of the election when Config.PreVote is true).
+	campaignElection CampaignType = "CampaignElection"
+	// campaignTransfer represents the type of leader transfer
+	campaignTransfer CampaignType = "CampaignTransfer"
 )
 
 var stmap = [...]string{
@@ -157,6 +176,10 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	// Logger is the logger used for raft log. For multinode which can host
+	// multiple raft group, each raft group can have its own logger
+	logger Logger
 }
 
 // newRaft return a raft peer with the given config
@@ -165,7 +188,30 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+
+	r := &Raft{
+		id:               c.ID,
+		Lead:             None,
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick,
+	}
+
+	//raft.Term = 0
+	//raft.Vote = raft.id
+	r.Prs = make(map[uint64]*Progress)
+	r.RaftLog = new(RaftLog)
+	r.votes = make(map[uint64]bool)
+
+	r.becomeFollower(r.Term, None)
+
+	var nodesStrs []string
+	for _, n := range r.Prs {
+		nodesStrs = append(nodesStrs, fmt.Sprintf("%x", n))
+	}
+
+	r.logger.Infof("newRaft %x [peers: [%s], term: %d, commit: %d, applied: %d, lastindex: %d, lastterm: %d]",
+		r.id, strings.Join(nodesStrs, ","), r.Term, r.RaftLog.committed, r.RaftLog.applied, r.RaftLog.LastIndex(), r.RaftLog.LastIndex())
+	return r
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -178,16 +224,33 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	r.Step(pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeat,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+	})
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+
+	if r.State == StateLeader {
+		r.heartbeatElapsed++
+	}
+
+	r.electionElapsed++
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	//r.step = stepFollower
+	r.reset(term)
+	r.Lead = lead
+	r.State = StateFollower
+	r.logger.Infof("%x became follower at term %d", r.id, r.Term)
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -207,6 +270,53 @@ func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	switch r.State {
 	case StateFollower:
+		switch m.MsgType {
+		case pb.MessageType_MsgPropose:
+			if r.Lead == None {
+				r.logger.Infof("%x no leader at term %d; dropping proposal", r.id, r.Term)
+				return ErrProposalDropped
+			}
+			m.To = r.Lead
+			r.send(m)
+		case pb.MessageType_MsgAppend:
+			r.electionElapsed = 0
+			r.Lead = m.From
+			r.handleAppendEntries(m)
+		case pb.MessageType_MsgHeartbeat:
+			r.electionElapsed = 0
+			r.Lead = m.From
+			r.handleHeartbeat(m)
+		//`case pb.MsgSnap:
+		//`	r.electionElapsed = 0
+		//`	r.lead = m.From
+		//`	r.handleSnapshot(m)
+		//case pb.MsgTransferLeader:
+		//	if r.lead == None {
+		//		r.logger.Infof("%x no leader at term %d; dropping leader transfer msg", r.id, r.Term)
+		//		return nil
+		//	}
+		//	m.To = r.lead
+		//	r.send(m)
+		case pb.MessageType_MsgTimeoutNow:
+			r.logger.Infof("%x [term %d] received MsgTimeoutNow from %x and starts an election to get leadership.", r.id, r.Term, m.From)
+			// Leadership transfers never use pre-vote even if r.preVote is true; we
+			// know we are not recovering from a partition so there is no need for the
+			// extra round trip.
+			r.hup(campaignTransfer)
+			//case pb.MsgReadIndex:
+			//	if r.lead == None {
+			//		r.logger.Infof("%x no leader at term %d; dropping index reading msg", r.id, r.Term)
+			//		return nil
+			//	}
+			//	m.To = r.lead
+			//	r.send(m)
+			//case pb.MsgReadIndexResp:
+			//	if len(m.Entries) != 1 {
+			//		r.logger.Errorf("%x invalid format of MsgReadIndexResp from %x, entries count: %d", r.id, m.From, len(m.Entries))
+			//		return nil
+			//	}
+			//	r.readStates = append(r.readStates, ReadState{Index: m.Index, RequestCtx: m.Entries[0].Data})
+		}
 	case StateCandidate:
 	case StateLeader:
 	}
@@ -236,4 +346,148 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+func (r *Raft) reset(term uint64) {
+	if r.Term != term {
+		r.Term = term
+		r.Vote = None
+	}
+	r.Lead = None
+
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	// TODO random election timeout
+
+	r.votes = make(map[uint64]bool)
+	for id, p := range r.Prs {
+		p = &Progress{
+			Match: 0,
+			Next:  r.RaftLog.LastIndex() + 1,
+		}
+		if id == r.id {
+			p.Match = r.RaftLog.LastIndex()
+		}
+	}
+}
+
+// send schedules persisting state to a stable storage and AFTER that
+// sending the message (as part of next Ready message processing).
+func (r *Raft) send(m pb.Message) {
+	if m.From == None {
+		m.From = r.id
+	}
+	if m.MsgType == pb.MessageType_MsgRequestVote || m.MsgType == pb.MessageType_MsgRequestVoteResponse {
+		if m.Term == 0 {
+			// All {pre-,}campaign messages need to have the term set when
+			// sending.
+			// - MsgVote: m.Term is the term the node is campaigning for,
+			//   non-zero as we increment the term when campaigning.
+			// - MsgVoteResp: m.Term is the new r.Term if the MsgVote was
+			//   granted, non-zero for the same reason MsgVote is
+			// - MsgPreVote: m.Term is the term the node will campaign,
+			//   non-zero as we use m.Term to indicate the next term we'll be
+			//   campaigning for
+			// - MsgPreVoteResp: m.Term is the term received in the original
+			//   MsgPreVote if the pre-vote was granted, non-zero for the
+			//   same reasons MsgPreVote is
+			panic(fmt.Sprintf("term should be set when sending %s", m.MsgType))
+		}
+	} else {
+		if m.Term != 0 {
+			panic(fmt.Sprintf("term should not be set when sending %s (was %d)", m.MsgType, m.Term))
+		}
+		// do not attach term to MsgProp, MsgReadIndex
+		// proposals are a way to forward to the leader and
+		// should be treated as local message.
+		// MsgReadIndex is also forwarded to leader.
+		if m.MsgType != pb.MessageType_MsgPropose {
+			m.Term = r.Term
+		}
+	}
+	r.msgs = append(r.msgs, m)
+}
+
+func (r *Raft) hup(t CampaignType) {
+	if r.State == StateLeader {
+		r.logger.Debugf("%x ignoring MsgHup because already leader", r.id)
+		return
+	}
+
+	if !r.promotable() {
+		r.logger.Warningf("%x is unpromotable and can not campaign", r.id)
+		return
+	}
+	//ents, err := r.RaftLog.slice(r.RaftLog.applied+1, r.RaftLog.committed+1, noLimit)
+	//if err != nil {
+	//	r.logger.Panicf("unexpected error getting unapplied entries (%v)", err)
+	//}
+	//if n := numOfPendingConf(ents); n != 0 && r.raftLog.committed > r.raftLog.applied {
+	//	r.logger.Warningf("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
+	//	return
+	//}
+
+	r.logger.Infof("%x is starting a new election at term %d", r.id, r.Term)
+	r.campaign(t)
+}
+
+// promotable indicates whether state machine can be promoted to leader,
+// which is true when its own id is in progress list.
+func (r *Raft) promotable() bool {
+	_, ok := r.Prs[r.id]
+	return ok
+}
+
+// campaign transitions the raft instance to candidate state. This must only be
+// called after verifying that this is a legitimate transition.
+func (r *Raft) campaign(t CampaignType) {
+	// if !r.promotable() {
+	// 	// This path should not be hit (callers are supposed to check), but
+	// 	// better safe than sorry.
+	// 	r.logger.Warningf("%x is unpromotable; campaign() should have been called", r.id)
+	// }
+	// var term uint64
+	// var voteMsg pb.MessageType
+	// if t == campaignPreElection {
+	// 	r.becomePreCandidate()
+	// 	voteMsg = pb.MsgPreVote
+	// 	// PreVote RPCs are sent for the next term before we've incremented r.Term.
+	// 	term = r.Term + 1
+	// } else {
+	// 	r.becomeCandidate()
+	// 	voteMsg = pb.MsgVote
+	// 	term = r.Term
+	// }
+	// if _, _, res := r.poll(r.id, voteRespMsgType(voteMsg), true); res == quorum.VoteWon {
+	// 	// We won the election after voting for ourselves (which must mean that
+	// 	// this is a single-node cluster). Advance to the next state.
+	// 	if t == campaignPreElection {
+	// 		r.campaign(campaignElection)
+	// 	} else {
+	// 		r.becomeLeader()
+	// 	}
+	// 	return
+	// }
+	// var ids []uint64
+	// {
+	// 	idMap := r.prs.Voters.IDs()
+	// 	ids = make([]uint64, 0, len(idMap))
+	// 	for id := range idMap {
+	// 		ids = append(ids, id)
+	// 	}
+	// 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	// }
+	// for _, id := range ids {
+	// 	if id == r.id {
+	// 		continue
+	// 	}
+	// 	r.logger.Infof("%x [logterm: %d, index: %d] sent %s request to %x at term %d",
+	// 		r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), voteMsg, id, r.Term)
+
+	// 	var ctx []byte
+	// 	if t == campaignTransfer {
+	// 		ctx = []byte(t)
+	// 	}
+	// 	r.send(pb.Message{Term: term, To: id, Type: voteMsg, Index: r.raftLog.lastIndex(), LogTerm: r.raftLog.lastTerm(), Context: ctx})
+	// }
 }
